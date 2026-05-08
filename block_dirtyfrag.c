@@ -15,6 +15,23 @@ static void sig_handler(int sig)
 	running = 0;
 }
 
+static int has_splice_to_socket(void)
+{
+	FILE *f = fopen("/proc/kallsyms", "r");
+	if (!f)
+		return 0;
+	char line[256];
+	int found = 0;
+	while (fgets(line, sizeof(line), f)) {
+		if (strstr(line, " splice_to_socket\n")) {
+			found = 1;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
 static int handle_event(void *ctx, void *data, size_t len)
 {
 	struct block_event *evt = data;
@@ -39,6 +56,7 @@ int main(int argc, char **argv)
 {
 	struct block_dirtyfrag_bpf *skel;
 	struct ring_buffer *rb;
+	int use_udp_encap;
 
 	skel = block_dirtyfrag_bpf__open_and_load();
 	if (!skel) {
@@ -46,13 +64,38 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if (block_dirtyfrag_bpf__attach(skel)) {
-		fprintf(stderr, "block-dirtyfrag: failed to attach BPF program\n");
+	use_udp_encap = !has_splice_to_socket();
+
+	if (use_udp_encap)
+		fprintf(stderr, "block-dirtyfrag: splice_to_socket not found — using UDP_ENCAP fallback\n");
+	else
+		fprintf(stderr, "block-dirtyfrag: splice_to_socket found — UDP splice hook is sufficient\n");
+
+	skel->links.block_rxrpc = bpf_program__attach(skel->progs.block_rxrpc);
+	if (!skel->links.block_rxrpc) {
+		fprintf(stderr, "block-dirtyfrag: failed to attach block_rxrpc\n");
 		block_dirtyfrag_bpf__destroy(skel);
 		return 1;
 	}
 
-	fprintf(stderr, "block-dirtyfrag: blocker active — AF_RXRPC + UDP splice + UDP_ENCAP blocked\n");
+	skel->links.block_udp_splice = bpf_program__attach(skel->progs.block_udp_splice);
+	if (!skel->links.block_udp_splice) {
+		fprintf(stderr, "block-dirtyfrag: failed to attach block_udp_splice\n");
+		block_dirtyfrag_bpf__destroy(skel);
+		return 1;
+	}
+
+	if (use_udp_encap) {
+		skel->links.block_udp_encap = bpf_program__attach(skel->progs.block_udp_encap);
+		if (!skel->links.block_udp_encap) {
+			fprintf(stderr, "block-dirtyfrag: failed to attach block_udp_encap\n");
+			block_dirtyfrag_bpf__destroy(skel);
+			return 1;
+		}
+	}
+
+	fprintf(stderr, "block-dirtyfrag: blocker active — AF_RXRPC + UDP splice%s blocked\n",
+		use_udp_encap ? " + UDP_ENCAP" : "");
 
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
 			      handle_event, NULL, NULL);
