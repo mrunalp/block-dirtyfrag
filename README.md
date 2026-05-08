@@ -273,6 +273,132 @@ block-dirtyfrag: BLOCKED XFRM from container pid=74644 comm=dirtyfrag-exp time=2
 
 ---
 
+## Testing Individual Defense Layers
+
+A comprehensive Python test (`test/test-all-layers.py`) exercises each BPF
+hook independently without running the full exploit.
+
+### From a privileged container
+
+Deploy the test script into a privileged pod:
+
+```bash
+oc create namespace layer-test
+oc apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: system:openshift:scc:privileged
+  namespace: layer-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:openshift:scc:privileged
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: layer-test
+EOF
+
+oc create configmap layer-test-script -n layer-test \
+  --from-file=test-all-layers.py=test/test-all-layers.py
+
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: layer-test
+  namespace: layer-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: registry.fedoraproject.org/fedora:latest
+    command: ["/bin/bash", "-c",
+      "dnf install -y python3 >/dev/null 2>&1 && python3 /scripts/test-all-layers.py"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: script
+      mountPath: /scripts
+      readOnly: true
+  volumes:
+  - name: script
+    configMap:
+      name: layer-test-script
+EOF
+
+oc wait -n layer-test pod/layer-test --for=condition=Ready --timeout=120s || true
+oc logs -n layer-test layer-test
+```
+
+Expected output with blocker active:
+
+```
+=== BPF LSM Defense Layer Tests ===
+uid=0 pid=1
+SELinux: system_u:system_r:spc_t:s0
+
+--- Layer 1: AF_RXRPC socket blocking ---
+  [PASS]  AF_RXRPC socket from container: blocked (expected: blocked)
+
+--- Layer 2a: NETLINK_XFRM from container pidns ---
+  [PASS]  NETLINK_XFRM without unshare (pidns > 0): blocked (expected: blocked)
+
+--- Layer 2b: NETLINK_XFRM after unshare (userns > 0) ---
+  [SKIP]  unshare(NEWUSER|NEWNET) failed — cannot test userns check
+
+--- Layer 3: splice-to-UDP (MSG_SPLICE_PAGES) ---
+  [INFO]  splice-to-UDP allowed — expected on pre-6.5 kernels (sendpage path, hook is no-op)
+
+--- Sanity checks (should all be allowed) ---
+  [PASS]  AF_INET TCP: allowed (expected: allowed)
+  [PASS]  AF_INET UDP: allowed (expected: allowed)
+  [PASS]  AF_INET6 TCP: allowed (expected: allowed)
+  [PASS]  AF_NETLINK (non-XFRM): allowed (expected: allowed)
+
+--- Host IPsec passthrough (NETLINK_XFRM at level 0) ---
+  [SKIP]  Running inside a container — cannot test host-level XFRM
+          Run this script via 'oc debug node/<node>' to test
+
+=== Summary: 6 passed, 0 failed, 3 skipped (out of 9) ===
+```
+
+Layer 2b is skipped because `spc_t` containers cannot `unshare` on RHEL.
+Layer 3 is informational on pre-6.5 kernels (the hook is a harmless no-op).
+
+### From the host (verifying IPsec passthrough)
+
+Run via `oc debug` to confirm host-level XFRM is unaffected:
+
+```bash
+oc debug node/<any-node> -- chroot /host python3 -c "
+import socket
+AF_NETLINK = 16
+NETLINK_XFRM = 6
+try:
+    s = socket.socket(AF_NETLINK, socket.SOCK_RAW, NETLINK_XFRM)
+    s.close()
+    print('PASS: NETLINK_XFRM from host (level 0) — ALLOWED, IPsec works')
+except OSError as e:
+    print(f'FAIL: NETLINK_XFRM from host — BLOCKED: {e}')
+"
+```
+
+Expected:
+
+```
+PASS: NETLINK_XFRM from host (level 0) — ALLOWED, IPsec works
+```
+
+### Clean up
+
+```bash
+oc delete namespace layer-test
+```
+
+---
+
 ## Building from Source
 
 ### Blocker image
@@ -313,6 +439,7 @@ test/
   02-rolebinding.yaml      # SCC grant
   03-job.yaml              # Exploit test Job
   run-exploit-test.sh      # Test wrapper script
+  test-all-layers.py       # Per-layer defense validation
 trigger-test.py            # Quick blocker validation
 verify-subsystems.py       # Comprehensive subsystem check
 testing-notes.md           # Detailed testing journal
