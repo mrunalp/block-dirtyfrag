@@ -15,6 +15,7 @@ spec:
         app: dirtyfrag-test
     spec:
       restartPolicy: Never
+      serviceAccountName: dirtyfrag-test
       containers:
       - name: test
         image: quay.io/mrunalp/block-dirtyfrag-test:latest
