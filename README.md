@@ -9,15 +9,18 @@ password via rxkad's in-place `pcbc(fcrypt)` decrypt on spliced page-cache
 pages.
 
 This document provides a **zero-reboot remediation** using a BPF LSM DaemonSet
-that blocks both exploit paths:
+with three layers of defense:
 
 - **AF\_RXRPC socket creation** — prevents the rxrpc/rxkad path entirely
-- **UDP splice blocking** — prevents the xfrm-ESP path by blocking
-  `MSG_SPLICE_PAGES` sends on UDP sockets (kernel 6.5+)
-- **UDP\_ENCAP blocking** — fallback for pre-6.5 kernels that blocks
-  `setsockopt(SOL_UDP, UDP_ENCAP)`
+- **NETLINK\_XFRM from containers** — blocks XFRM socket creation from
+  non-init user or PID namespaces, covering both privileged and non-privileged
+  containers while leaving host-level IPsec/VPN unaffected
+- **UDP splice blocking** — blocks `MSG_SPLICE_PAGES` sends on UDP sockets
+  (kernel 6.5+), closing the edge case where a container with `hostPID` +
+  `hostNetwork` + `CAP_NET_ADMIN` bypasses namespace checks
 
-Other networking (UDP, TCP, AF\_ALG, AF\_NETLINK, etc.) is unaffected.
+Other networking (UDP, TCP, AF\_ALG, AF\_NETLINK for non-XFRM, etc.) is
+completely unaffected.
 
 ## Quick Start
 
@@ -32,7 +35,7 @@ oc apply -f daemonset.yaml
 # 3. Verify
 oc get pods -n dirtyfrag-mitigation-ebpf     # All nodes should show Running
 oc logs -n dirtyfrag-mitigation-ebpf -l app=block-dirtyfrag
-# Expected: "block-dirtyfrag: blocker active — AF_RXRPC + UDP splice + UDP_ENCAP blocked"
+# Expected: "block-dirtyfrag: blocker active — AF_RXRPC + XFRM-from-container + UDP-splice blocked"
 ```
 
 No reboots. No node drains. No pod restarts. Protection is immediate and
@@ -150,8 +153,7 @@ SHA256 before: 8969560ae8e6e21c6184c1451f59418822ee69dd5d946d71987b55236bbc0feb
 
 --- Running exploit as uid=1000 (testuser) ---
 
-[su] installed 48 xfrm SAs
-[su] do_one_write #0 at off=0x0 failed
+[su] add_xfrm_sa #0 failed
 [su] corruption stage failed (status=0x200)
 dirtyfrag: failed (rc=1)
 
@@ -176,13 +178,24 @@ oc delete namespace dirtyfrag-test
 
 ## BPF LSM DaemonSet Deployment
 
-The BPF LSM approach uses three hooks for coverage across kernel versions:
+The BPF LSM approach uses three layers of defense:
 
-- `lsm/socket_create` — blocks all `AF_RXRPC` (family 33) socket creation
-- `lsm/socket_sendmsg` — blocks `MSG_SPLICE_PAGES` sends on UDP sockets
-  (kernel 6.5+, targets the splice primitive directly)
-- `lsm/socket_setsockopt` — blocks `setsockopt(SOL_UDP, UDP_ENCAP)` (pre-6.5
-  fallback, blocks UDP ESP encapsulation setup)
+| Layer | Hook | What it blocks | Coverage |
+|-------|------|---------------|----------|
+| 1 | `lsm/socket_create` | AF\_RXRPC sockets | rxrpc/rxkad path (all kernels) |
+| 2 | `lsm/socket_create` | NETLINK\_XFRM from userns level > 0 or pidns level > 0 | ESP path from containers (all kernels) |
+| 3 | `lsm/socket_sendmsg` | MSG\_SPLICE\_PAGES on UDP | ESP path from hostPID+hostNetwork+CAP\_NET\_ADMIN (kernel 6.5+) |
+
+Layer 2 checks `task->cred->user_ns->level` and
+`task->nsproxy->pid_ns_for_children->level` via BPF CO-RE.  This catches both
+non-privileged containers (userns level > 0 after `unshare`) and privileged
+containers (pidns level > 0).  Host-level IPsec/VPN runs at level 0 for both
+namespaces and is completely unaffected.
+
+Layer 3 is defense-in-depth for the edge case where a container has `hostPID`
+\+ `hostNetwork` + `CAP_NET_ADMIN` (both namespace levels are 0).  On pre-6.5
+kernels, this layer is a harmless no-op since splice-to-socket uses the
+`sendpage` path instead of `sendmsg`.
 
 ### Prerequisites
 
@@ -229,7 +242,7 @@ oc logs -n dirtyfrag-mitigation-ebpf -l app=block-dirtyfrag
 Expected:
 
 ```
-block-dirtyfrag: blocker active — AF_RXRPC + UDP splice + UDP_ENCAP blocked
+block-dirtyfrag: blocker active — AF_RXRPC + XFRM-from-container + UDP-splice blocked
 ```
 
 ---
@@ -255,7 +268,7 @@ oc logs -n dirtyfrag-mitigation-ebpf -l app=block-dirtyfrag
 ```
 
 ```
-block-dirtyfrag: BLOCKED UDP_ENCAP (ESP) pid=24212 comm=exp time=2026-05-07 23:44:32
+block-dirtyfrag: BLOCKED XFRM from container pid=74644 comm=dirtyfrag-exp time=2026-05-08 15:14:58
 ```
 
 ---
@@ -286,7 +299,7 @@ reports results.
 ### File layout
 
 ```
-block_dirtyfrag.bpf.c     # BPF kernel program (3 LSM hooks)
+block_dirtyfrag.bpf.c     # BPF kernel program (3 defense layers)
 block_dirtyfrag.c          # Userspace loader (libbpf skeleton)
 block_dirtyfrag.h          # Shared event struct
 Makefile                   # Blocker build pipeline
