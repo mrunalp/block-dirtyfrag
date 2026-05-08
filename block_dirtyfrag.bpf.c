@@ -1,20 +1,18 @@
 /* BPF LSM program to block DirtyFrag.
  *
- * Three hooks block both exploit paths:
+ * Two hooks block both exploit paths:
  *
  * 1. socket_create — blocks AF_RXRPC socket creation, preventing the
  *    rxrpc/rxkad page-cache write path entirely.
  *
- * 2. socket_sendmsg — blocks MSG_SPLICE_PAGES sends on UDP sockets
- *    (kernel 6.5+).  The exploit splices page-cache pages into a UDP
- *    socket; the kernel sets MSG_SPLICE_PAGES for zero-copy sends.
- *    Normal sendmsg/write is unaffected.
+ * 2. socket_create — blocks NETLINK_XFRM socket creation from non-init
+ *    user namespaces (level > 0).  The ESP exploit must unshare into a
+ *    new user namespace to gain CAP_NET_ADMIN, then create XFRM SAs
+ *    via netlink.  Blocking NETLINK_XFRM at level > 0 prevents the
+ *    exploit while allowing host-level IPsec/VPN (level 0) to work.
  *
- * 3. socket_setsockopt — blocks setsockopt(SOL_UDP, UDP_ENCAP) as a
- *    fallback for pre-6.5 kernels where splice-to-socket uses the
- *    sendpage path instead of sendmsg+MSG_SPLICE_PAGES.
- *
- * Other networking (TCP, AF_ALG, AF_NETLINK, etc.) is unaffected.
+ * Other networking (UDP, TCP, AF_ALG, AF_NETLINK for non-XFRM, etc.)
+ * is completely unaffected.
  */
 
 #include <linux/types.h>
@@ -25,33 +23,21 @@
 #include <bpf/bpf_core_read.h>
 #include "block_dirtyfrag.h"
 
-/* CO-RE struct stubs — field names must match kernel BTF.
- * Actual offsets are relocated at load time by libbpf. */
-struct sock_common {
-	__u16 skc_family;
+/* CO-RE struct stubs — field names must match kernel BTF. */
+struct user_namespace {
+	int level;
 } __attribute__((preserve_access_index));
 
-struct sock {
-	struct sock_common __sk_common;
-	__u16 sk_protocol;
+struct cred___local {
+	struct user_namespace *user_ns;
 } __attribute__((preserve_access_index));
 
-struct socket {
-	short type;
-	struct sock *sk;
+struct task_struct___local {
+	const struct cred___local *cred;
 } __attribute__((preserve_access_index));
 
-struct msghdr {
-	unsigned int msg_flags;
-} __attribute__((preserve_access_index));
-
-#define AF_INET   2
-#define AF_INET6 10
-#define SOCK_DGRAM 2
-#define IPPROTO_UDP 17
-#define SOL_UDP    17
-#define UDP_ENCAP  100
-#define MSG_SPLICE_PAGES 0x08000000
+#define AF_NETLINK   16
+#define NETLINK_XFRM  6
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -71,65 +57,34 @@ static __always_inline void emit_event(__u32 reason)
 	}
 }
 
-/* Block AF_RXRPC sockets (rxrpc/rxkad path) */
 SEC("lsm/socket_create")
-int BPF_PROG(block_rxrpc, int family, int type, int protocol,
+int BPF_PROG(block_dirtyfrag, int family, int type, int protocol,
 	     int kern, int ret)
 {
 	if (ret)
 		return ret;
 
-	if (family != AF_RXRPC)
-		return 0;
+	/* Block AF_RXRPC sockets (rxrpc/rxkad path) */
+	if (family == AF_RXRPC) {
+		emit_event(BLOCK_REASON_RXRPC);
+		return -EPERM;
+	}
 
-	emit_event(BLOCK_REASON_RXRPC);
-	return -EPERM;
-}
+	/* Block NETLINK_XFRM from non-init user namespaces (ESP path) */
+	if (family == AF_NETLINK && protocol == NETLINK_XFRM) {
+		struct task_struct___local *task;
+		int level;
 
-/* Block splice-to-UDP (ESP path, kernel 6.5+) */
-SEC("lsm/socket_sendmsg")
-int BPF_PROG(block_udp_splice, struct socket *sock,
-	     struct msghdr *msg, int size, int ret)
-{
-	struct sock *sk;
+		task = (void *)bpf_get_current_task();
+		level = BPF_CORE_READ(task, cred, user_ns, level);
 
-	if (ret)
-		return ret;
+		if (level > 0) {
+			emit_event(BLOCK_REASON_XFRM);
+			return -EPERM;
+		}
+	}
 
-	if (!(BPF_CORE_READ(msg, msg_flags) & MSG_SPLICE_PAGES))
-		return 0;
-
-	if (BPF_CORE_READ(sock, type) != SOCK_DGRAM)
-		return 0;
-
-	sk = BPF_CORE_READ(sock, sk);
-	if (!sk)
-		return 0;
-
-	if (BPF_CORE_READ(sk, __sk_common.skc_family) != AF_INET &&
-	    BPF_CORE_READ(sk, __sk_common.skc_family) != AF_INET6)
-		return 0;
-
-	if (BPF_CORE_READ(sk, sk_protocol) != IPPROTO_UDP)
-		return 0;
-
-	emit_event(BLOCK_REASON_UDP_SPLICE);
-	return -EPERM;
-}
-
-/* Block UDP_ENCAP setsockopt (ESP path, pre-6.5 fallback) */
-SEC("lsm/socket_setsockopt")
-int BPF_PROG(block_udp_encap, struct socket *sock,
-	     int level, int optname, int ret)
-{
-	if (ret)
-		return ret;
-
-	if (level != SOL_UDP || optname != UDP_ENCAP)
-		return 0;
-
-	emit_event(BLOCK_REASON_UDP_ENCAP);
-	return -EPERM;
+	return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";
