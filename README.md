@@ -192,6 +192,10 @@ non-privileged containers (userns level > 0 after `unshare`) and privileged
 containers (pidns level > 0).  Host-level IPsec/VPN runs at level 0 for both
 namespaces and is completely unaffected.
 
+All layers skip kernel-internal socket creation (`kern=1`) to avoid
+interfering with legitimate kernel operations like network namespace setup,
+which creates internal NETLINK\_XFRM sockets.
+
 Layer 3 is defense-in-depth for the edge case where a container has `hostPID`
 \+ `hostNetwork` + `CAP_NET_ADMIN` (both namespace levels are 0).  On pre-6.5
 kernels, this layer is a harmless no-op since splice-to-socket uses the
@@ -364,8 +368,68 @@ SELinux: system_u:system_r:spc_t:s0
 === Summary: 6 passed, 0 failed, 3 skipped (out of 9) ===
 ```
 
-Layer 2b is skipped because `spc_t` containers cannot `unshare` on RHEL.
-Layer 3 is informational on pre-6.5 kernels (the hook is a harmless no-op).
+Layer 2b is skipped because Python's `unshare` via ctypes encounters memory
+allocation issues in containers.  Layer 3 is informational on pre-6.5 kernels
+(the hook is a harmless no-op).
+
+### Testing Layer 2b with the C test
+
+Layer 2b (userns-level XFRM blocking after `unshare`) requires a C binary
+since Python's ctypes has memory issues with `unshare` in containers.  Build
+and run `test/test_layer2b.c`:
+
+```bash
+# Build (from the repo root)
+podman run --rm -v ./test:/build:Z registry.access.redhat.com/ubi9/ubi:latest \
+  bash -c 'dnf install -y gcc >/dev/null 2>&1 && gcc -O0 -Wall -o /build/test_layer2b /build/test_layer2b.c'
+
+# Deploy into a privileged pod and run as non-root
+oc create configmap layer2b-binary -n layer-test \
+  --from-file=test_layer2b=test/test_layer2b
+
+oc apply -f - <<EOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: layer2b-test
+  namespace: layer-test
+spec:
+  restartPolicy: Never
+  containers:
+  - name: test
+    image: quay.io/mrunalp/block-dirtyfrag-test:latest
+    command: ["bash", "-c",
+      "cp /config/test_layer2b /tmp/test_layer2b && chmod +x /tmp/test_layer2b && runuser -u testuser -- /tmp/test_layer2b"]
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: binary
+      mountPath: /config
+      readOnly: true
+  volumes:
+  - name: binary
+    configMap:
+      name: layer2b-binary
+      defaultMode: 0755
+EOF
+
+oc logs -n layer-test layer2b-test
+```
+
+Expected output with blocker active:
+
+```
+uid=1000 pid=4
+Step 1: unshare(NEWUSER|NEWNET)
+  OK — userns level > 0
+
+Step 2: socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM)
+  BLOCKED: Operation not permitted (errno=1)
+  Layer 2b is working!
+Child exit code: 0
+```
+
+Without the blocker, Step 2 shows `ALLOWED`.
 
 ### From the host (verifying IPsec passthrough)
 
@@ -439,7 +503,8 @@ test/
   02-rolebinding.yaml      # SCC grant
   03-job.yaml              # Exploit test Job
   run-exploit-test.sh      # Test wrapper script
-  test-all-layers.py       # Per-layer defense validation
+  test-all-layers.py       # Per-layer defense validation (Python)
+  test_layer2b.c           # Layer 2b userns XFRM test (C)
 trigger-test.py            # Quick blocker validation
 verify-subsystems.py       # Comprehensive subsystem check
 testing-notes.md           # Detailed testing journal
