@@ -100,6 +100,10 @@ int BPF_PROG(block_dirtyfrag, int family, int type, int protocol,
 	if (ret)
 		return ret;
 
+	/* Allow kernel-internal socket creation (e.g. during netns setup) */
+	if (kern)
+		return 0;
+
 	/* Block AF_RXRPC sockets (rxrpc/rxkad path) */
 	if (family == AF_RXRPC) {
 		emit_event(BLOCK_REASON_RXRPC);
