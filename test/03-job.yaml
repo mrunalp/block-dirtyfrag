@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dirtyfrag-exploit-test
+  namespace: dirtyfrag-test
+  annotations:
+    kubernetes.io/description: Testing DirtyFrag vulnerability.
+  labels:
+    app: dirtyfrag-test
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: dirtyfrag-test
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: test
+        image: quay.io/mrunalp/block-dirtyfrag-test:latest
+        securityContext:
+          privileged: true
+      terminationGracePeriodSeconds: 5

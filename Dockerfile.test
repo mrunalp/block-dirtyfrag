@@ -1,0 +1,24 @@
+FROM registry.access.redhat.com/ubi9/ubi:latest AS builder
+
+RUN dnf install -y \
+    --setopt=install_weak_deps=0 \
+    gcc util-linux-core \
+    && dnf clean all
+
+WORKDIR /build
+COPY exp.c ./
+RUN gcc -O0 -Wall -o dirtyfrag-exp exp.c -lutil
+
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+RUN dnf install -y \
+    --setopt=install_weak_deps=0 \
+    util-linux-core \
+    && dnf clean all
+
+RUN useradd -u 1000 -m testuser
+
+COPY --from=builder /build/dirtyfrag-exp /usr/local/bin/dirtyfrag-exp
+COPY test/run-exploit-test.sh /usr/local/bin/run-exploit-test.sh
+
+ENTRYPOINT ["/usr/local/bin/run-exploit-test.sh"]
