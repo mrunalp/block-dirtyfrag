@@ -135,8 +135,11 @@ block_xfrm:
  */
 SEC("lsm/socket_sendmsg")
 int BPF_PROG(block_udp_splice, struct socket *sock,
-	     struct msghdr *msg, int size)
+	     struct msghdr *msg, int size, int ret)
 {
+	if (ret)
+		return ret;
+
 	if (!(BPF_CORE_READ(msg, msg_flags) & MSG_SPLICE_PAGES))
 		return 0;
 
@@ -152,7 +155,7 @@ int BPF_PROG(block_udp_splice, struct socket *sock,
 		return 0;
 
 	emit_event(BLOCK_REASON_UDP_SPLICE);
-	return -EPERM;
+	return -1;
 }
 
 char LICENSE[] SEC("license") = "GPL";
