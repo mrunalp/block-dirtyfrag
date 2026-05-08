@@ -12,8 +12,10 @@ This document provides a **zero-reboot remediation** using a BPF LSM DaemonSet
 that blocks both exploit paths:
 
 - **AF\_RXRPC socket creation** — prevents the rxrpc/rxkad path entirely
-- **UDP\_ENCAP setsockopt** — prevents the xfrm-ESP path by blocking the
-  UDP ESP encapsulation needed to receive ESP-in-UDP packets
+- **UDP splice blocking** — prevents the xfrm-ESP path by blocking
+  `MSG_SPLICE_PAGES` sends on UDP sockets (kernel 6.5+)
+- **UDP\_ENCAP blocking** — fallback for pre-6.5 kernels that blocks
+  `setsockopt(SOL_UDP, UDP_ENCAP)`
 
 Other networking (UDP, TCP, AF\_ALG, AF\_NETLINK, etc.) is unaffected.
 
@@ -24,15 +26,13 @@ Other networking (UDP, TCP, AF\_ALG, AF\_NETLINK, etc.) is unaffected.
 oc debug node/<any-node> -- chroot /host cat /sys/kernel/security/lsm
 # Must contain "bpf"
 
-# 2. Deploy the namespace and grant privileged SCC
+# 2. Deploy the blocker
 oc apply -f daemonset.yaml
 
-# 3. DaemonSet pods will start automatically on all nodes
-
-# 4. Verify
+# 3. Verify
 oc get pods -n dirtyfrag-mitigation-ebpf     # All nodes should show Running
 oc logs -n dirtyfrag-mitigation-ebpf -l app=block-dirtyfrag
-# Expected: "block-dirtyfrag: blocker active — AF_RXRPC sockets and UDP_ENCAP blocked"
+# Expected: "block-dirtyfrag: blocker active — AF_RXRPC + UDP splice + UDP_ENCAP blocked"
 ```
 
 No reboots. No node drains. No pod restarts. Protection is immediate and
@@ -41,10 +41,10 @@ covers all processes on all nodes (100% coverage).
 ## Table of Contents
 
 1. [How the Exploit Works](#how-the-exploit-works)
-2. [Confirming Vulnerability on Your Cluster](#confirming-vulnerability-on-your-cluster)
+2. [Confirming Vulnerability with the Exploit Test](#confirming-vulnerability-with-the-exploit-test)
 3. [BPF LSM DaemonSet Deployment](#bpf-lsm-daemonset-deployment)
 4. [Post-Deployment Verification](#post-deployment-verification)
-5. [Building the Image from Source](#building-the-image-from-source)
+5. [Building from Source](#building-from-source)
 6. [Removal](#removal)
 
 ---
@@ -83,42 +83,87 @@ default only on Ubuntu).
 
 ---
 
-## Confirming Vulnerability on Your Cluster
+## Confirming Vulnerability with the Exploit Test
 
-Create a new `dirtyfrag-test` namespace on your cluster and run the test
-script by applying the manifests in [the `test` directory](test):
+A containerized exploit test is included.  It compiles the DirtyFrag exploit
+(`exp.c`), runs it as an unprivileged user inside a privileged pod, and
+reports whether the page cache was corrupted.
 
-```bash
-oc apply -f test
-```
-
-Check the results:
+### Build and push the test image
 
 ```bash
-oc wait pod/dirtyfrag-test -n dirtyfrag-test \
-  --for=jsonpath='{.status.phase}'=Succeeded --timeout=120s
-oc -n dirtyfrag-test logs -l app=dirtyfrag-test
+podman build -f Dockerfile.test -t quay.io/<org>/block-dirtyfrag-test:latest .
+podman push quay.io/<org>/block-dirtyfrag-test:latest
 ```
 
-**On a vulnerable cluster** you will see:
+Update the image reference in `test/03-job.yaml` if using a different registry.
+
+### Run the test
+
+```bash
+oc apply -f test/
+```
+
+Wait for the Job to complete and check the logs:
+
+```bash
+oc wait -n dirtyfrag-test job/dirtyfrag-exploit-test \
+  --for=condition=Complete --timeout=120s
+oc logs -n dirtyfrag-test -l job-name=dirtyfrag-exploit-test
+```
+
+**On a vulnerable cluster** (no blocker deployed):
 
 ```
-=== DirtyFrag Vulnerability Test ===
+=== DirtyFrag Exploit Test ===
+Kernel: 5.14.0-687.5.1.el9_8.x86_64
+Target: /usr/bin/su
 
---- Test 1: AF_RXRPC socket creation ---
-  AF_RXRPC socket: ALLOWED
+SHA256 before: 8969560ae8e6e21c6184c1451f59418822ee69dd5d946d71987b55236bbc0feb
 
---- Test 2: XFRM netlink socket ---
-  XFRM netlink socket: ALLOWED
+--- Running exploit as uid=1000 (testuser) ---
 
---- Test 3: UDP ESP encapsulation ---
-  UDP_ENCAP_ESPINUDP: ALLOWED
+[su] installed 48 xfrm SAs
+[su] wrote 192 bytes to /usr/bin/su starting at 0x0
+[su] /usr/bin/su page-cache patched (entry 0x78 = shellcode)
 
-=== Summary ===
-  rxrpc/rxkad path: VULNERABLE (AF_RXRPC sockets allowed)
-  xfrm-ESP path:    POTENTIALLY VULNERABLE (XFRM + UDP_ENCAP allowed)
+--- Exploit exit code: 124 ---
 
-RESULT: AT LEAST ONE PATH AVAILABLE — system may be vulnerable
+SHA256 after:  d42402457db3ea075352e9b76c622d3ff0bb89326e6f3511d5279b0e550ead31
+Bytes at 0x78: 31ff31f631c0b06a
+
+=== Result ===
+VULNERABLE — page cache corrupted, shellcode injected into /usr/bin/su
+
+The kernel is vulnerable to DirtyFrag (xfrm-ESP page-cache write).
+Deploy the BPF LSM blocker: oc apply -f daemonset.yaml
+```
+
+**After deploying the blocker:**
+
+```
+=== DirtyFrag Exploit Test ===
+Kernel: 5.14.0-687.5.1.el9_8.x86_64
+Target: /usr/bin/su
+
+SHA256 before: 8969560ae8e6e21c6184c1451f59418822ee69dd5d946d71987b55236bbc0feb
+
+--- Running exploit as uid=1000 (testuser) ---
+
+[su] installed 48 xfrm SAs
+[su] do_one_write #0 at off=0x0 failed
+[su] corruption stage failed (status=0x200)
+dirtyfrag: failed (rc=1)
+
+--- Exploit exit code: 1 ---
+
+SHA256 after:  8969560ae8e6e21c6184c1451f59418822ee69dd5d946d71987b55236bbc0feb
+Bytes at 0x78: 0300000004000000
+
+=== Result ===
+BLOCKED — exploit failed, page cache intact
+
+The BPF LSM blocker is working. The exploit could not corrupt /usr/bin/su.
 ```
 
 ### Clean up
@@ -131,11 +176,13 @@ oc delete namespace dirtyfrag-test
 
 ## BPF LSM DaemonSet Deployment
 
-The BPF LSM approach uses two hooks:
+The BPF LSM approach uses three hooks for coverage across kernel versions:
 
-- `socket_create` — blocks all `AF_RXRPC` (family 33) socket creation
-- `socket_setsockopt` — blocks `setsockopt(SOL_UDP, UDP_ENCAP)`, preventing
-  the UDP ESP encapsulation required by the xfrm-ESP exploit path
+- `lsm/socket_create` — blocks all `AF_RXRPC` (family 33) socket creation
+- `lsm/socket_sendmsg` — blocks `MSG_SPLICE_PAGES` sends on UDP sockets
+  (kernel 6.5+, targets the splice primitive directly)
+- `lsm/socket_setsockopt` — blocks `setsockopt(SOL_UDP, UDP_ENCAP)` (pre-6.5
+  fallback, blocks UDP ESP encapsulation setup)
 
 ### Prerequisites
 
@@ -159,7 +206,7 @@ only scenario requiring a reboot):
 oc apply -f machineconfig-enable-bpf-lsm.yaml
 ```
 
-### Step 1: Create the namespace, grant the SCC, and deploy
+### Step 1: Deploy
 
 ```bash
 oc apply -f daemonset.yaml
@@ -171,17 +218,7 @@ oc apply -f daemonset.yaml
 oc get pods -n dirtyfrag-mitigation-ebpf -o wide
 ```
 
-Expected: one pod per node, all `Running`:
-
-```
-NAME                          READY   STATUS    AGE   NODE
-block-dirtyfrag-2jhzf         1/1     Running   34s   ci-...-master-2
-block-dirtyfrag-4dfq7         1/1     Running   34s   ci-...-master-1
-block-dirtyfrag-c2ts8         1/1     Running   34s   ci-...-worker-c
-block-dirtyfrag-ctblk         1/1     Running   34s   ci-...-worker-a
-block-dirtyfrag-m26sx         1/1     Running   34s   ci-...-worker-b
-block-dirtyfrag-xsh6d         1/1     Running   34s   ci-...-master-0
-```
+Expected: one pod per node, all `Running`.
 
 ### Step 3: Verify the blocker is active
 
@@ -192,107 +229,82 @@ oc logs -n dirtyfrag-mitigation-ebpf -l app=block-dirtyfrag
 Expected:
 
 ```
-block-dirtyfrag: blocker active — AF_RXRPC sockets and XFRM ESP states blocked
+block-dirtyfrag: blocker active — AF_RXRPC + UDP splice + UDP_ENCAP blocked
 ```
 
 ---
 
 ## Post-Deployment Verification
 
-Re-run the same test from the [Confirming Vulnerability](#confirming-vulnerability-on-your-cluster) section.
+Re-run the exploit test from the [Confirming Vulnerability](#confirming-vulnerability-with-the-exploit-test) section:
 
-**After deploying the BPF LSM DaemonSet**, the output will be:
-
-```
-=== DirtyFrag Vulnerability Test ===
-
---- Test 1: AF_RXRPC socket creation ---
-  AF_RXRPC socket: BLOCKED — [Errno 1] Operation not permitted
-
---- Test 2: XFRM netlink socket ---
-  XFRM netlink socket: ALLOWED
-
---- Test 3: UDP ESP encapsulation ---
-  UDP_ENCAP_ESPINUDP: ALLOWED
-
-=== Summary ===
-  rxrpc/rxkad path: MITIGATED (AF_RXRPC sockets blocked)
-  xfrm-ESP path:    MITIGATED
-
-RESULT: ALL EXPLOIT PATHS BLOCKED — mitigation active
+```bash
+oc delete namespace dirtyfrag-test 2>/dev/null
+oc apply -f test/
+oc wait -n dirtyfrag-test job/dirtyfrag-exploit-test \
+  --for=condition=Complete --timeout=120s
+oc logs -n dirtyfrag-test -l job-name=dirtyfrag-exploit-test
 ```
 
-The DaemonSet logs will show blocked attempts:
+The output should show `BLOCKED — exploit failed, page cache intact`.
+
+The DaemonSet logs will show the blocked attempt:
 
 ```bash
 oc logs -n dirtyfrag-mitigation-ebpf -l app=block-dirtyfrag
 ```
 
 ```
-block-dirtyfrag: blocker active — AF_RXRPC sockets and UDP_ENCAP blocked
-block-dirtyfrag: BLOCKED AF_RXRPC socket pid=16777    comm=python3 time=2026-05-07 10:23:45
-```
-
-### Verifying Other Subsystems Are Unaffected
-
-Run `verify-subsystems.py` on a node to confirm that only the exploit
-subsystems are blocked:
-
-```bash
-oc debug node/<any-node> -- chroot /host python3 -c "
-import socket
-AF_RXRPC = 33
-tests = [
-    ('AF_RXRPC', AF_RXRPC, socket.SOCK_DGRAM, socket.AF_INET),
-    ('AF_INET TCP', socket.AF_INET, socket.SOCK_STREAM, 0),
-    ('AF_INET UDP', socket.AF_INET, socket.SOCK_DGRAM, 0),
-    ('AF_INET6 TCP', socket.AF_INET6, socket.SOCK_STREAM, 0),
-    ('AF_NETLINK', socket.AF_NETLINK, socket.SOCK_RAW, 0),
-]
-for label, fam, st, proto in tests:
-    try:
-        s = socket.socket(fam, st, proto)
-        print(f'  ALLOWED  {label}')
-        s.close()
-    except OSError as e:
-        print(f'  BLOCKED  {label} -- {e}')
-"
-```
-
-Expected output:
-
-```
-  BLOCKED  AF_RXRPC -- [Errno 1] Operation not permitted
-  ALLOWED  AF_INET TCP
-  ALLOWED  AF_INET UDP
-  ALLOWED  AF_INET6 TCP
-  ALLOWED  AF_NETLINK
+block-dirtyfrag: BLOCKED UDP_ENCAP (ESP) pid=24212 comm=exp time=2026-05-07 23:44:32
 ```
 
 ---
 
-## Building the Image from Source
+## Building from Source
 
-```
-block_dirtyfrag.bpf.c     # BPF kernel program (two LSM hooks)
-block_dirtyfrag.c          # Userspace loader (libbpf skeleton)
-block_dirtyfrag.h          # Shared event struct
-Makefile                   # Build pipeline
-Dockerfile                 # Multi-stage build
-daemonset.yaml             # Namespace + DaemonSet manifest
-trigger-test.py            # Quick validation script
-verify-subsystems.py       # Comprehensive subsystem verification
-```
-
-Build and push:
+### Blocker image
 
 ```bash
 podman build -t quay.io/<org>/block-dirtyfrag:latest .
 podman push quay.io/<org>/block-dirtyfrag:latest
 ```
 
-The Dockerfile uses a multi-stage build: Fedora with clang/bpftool/libbpf-devel
-for compilation, UBI 9 minimal for the runtime image.
+Multi-stage build: Fedora with clang/bpftool/libbpf-devel for compilation,
+UBI 9 minimal for the runtime image.
+
+### Exploit test image
+
+```bash
+podman build -f Dockerfile.test -t quay.io/<org>/block-dirtyfrag-test:latest .
+podman push quay.io/<org>/block-dirtyfrag-test:latest
+```
+
+Multi-stage build: UBI 9 with gcc for compilation, UBI 9 for runtime with a
+non-root `testuser` (uid=1000) and a wrapper script that runs the exploit and
+reports results.
+
+### File layout
+
+```
+block_dirtyfrag.bpf.c     # BPF kernel program (3 LSM hooks)
+block_dirtyfrag.c          # Userspace loader (libbpf skeleton)
+block_dirtyfrag.h          # Shared event struct
+Makefile                   # Blocker build pipeline
+Dockerfile                 # Blocker image
+Dockerfile.test            # Exploit test image
+exp.c                      # DirtyFrag exploit source
+daemonset.yaml             # Namespace + DaemonSet manifest
+machineconfig-enable-bpf-lsm.yaml
+test/
+  01-namespace.yaml        # Privileged test namespace
+  02-rolebinding.yaml      # SCC grant
+  03-job.yaml              # Exploit test Job
+  run-exploit-test.sh      # Test wrapper script
+trigger-test.py            # Quick blocker validation
+verify-subsystems.py       # Comprehensive subsystem check
+testing-notes.md           # Detailed testing journal
+cluster-assessment.md      # Cluster vulnerability assessment
+```
 
 ---
 
