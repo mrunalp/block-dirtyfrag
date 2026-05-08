@@ -1,17 +1,24 @@
 /* BPF LSM program to block DirtyFrag.
  *
- * A single socket_create hook blocks both exploit paths:
+ * Three layers of defense:
  *
- * 1. Blocks AF_RXRPC socket creation — prevents the rxrpc/rxkad
- *    page-cache write path entirely.
+ * 1. socket_create: Blocks AF_RXRPC socket creation — prevents the
+ *    rxrpc/rxkad page-cache write path entirely.
  *
- * 2. Blocks NETLINK_XFRM socket creation from containers — prevents
- *    the xfrm-ESP page-cache write path.  The check covers both:
+ * 2. socket_create: Blocks NETLINK_XFRM socket creation from
+ *    containers — prevents the xfrm-ESP page-cache write path.
+ *    The check covers both:
  *    - Non-privileged containers: userns level > 0 (after unshare)
  *    - Privileged containers: pidns level > 0 (container PID namespace)
  *    Host-level IPsec/VPN (init userns + init pidns) is unaffected.
  *
- * Other networking is completely unaffected.
+ * 3. socket_sendmsg: Blocks MSG_SPLICE_PAGES on UDP sockets globally.
+ *    This is the actual dangerous primitive — splicing page-cache pages
+ *    into a UDP socket lets the ESP decryption engine overwrite them
+ *    in place.  Normal UDP send/sendmsg (without splice) is unaffected.
+ *    No legitimate IPsec implementation uses splice-to-UDP.
+ *    This layer closes the gap where a container with hostPID +
+ *    hostNetwork + CAP_NET_ADMIN bypasses both namespace checks.
  */
 
 #include <linux/types.h>
@@ -44,8 +51,29 @@ struct task_struct___local {
 	struct nsproxy___local *nsproxy;
 } __attribute__((preserve_access_index));
 
-#define AF_NETLINK   16
-#define NETLINK_XFRM  6
+struct sock_common {
+	unsigned short skc_family;
+} __attribute__((preserve_access_index));
+
+struct sock {
+	struct sock_common __sk_common;
+} __attribute__((preserve_access_index));
+
+struct socket {
+	short type;
+	struct sock *sk;
+} __attribute__((preserve_access_index));
+
+struct msghdr {
+	unsigned int msg_flags;
+} __attribute__((preserve_access_index));
+
+#define AF_NETLINK        16
+#define AF_INET            2
+#define AF_INET6          10
+#define NETLINK_XFRM       6
+#define SOCK_DGRAM         2
+#define MSG_SPLICE_PAGES   0x08000000
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -100,6 +128,31 @@ int BPF_PROG(block_dirtyfrag, int family, int type, int protocol,
 block_xfrm:
 	emit_event(BLOCK_REASON_XFRM);
 	return -1;
+}
+
+/* Layer 3: block MSG_SPLICE_PAGES on UDP sockets globally.
+ * Catches the dangerous primitive regardless of how CAP_NET_ADMIN was obtained.
+ */
+SEC("lsm/socket_sendmsg")
+int BPF_PROG(block_udp_splice, struct socket *sock,
+	     struct msghdr *msg, int size)
+{
+	if (!(BPF_CORE_READ(msg, msg_flags) & MSG_SPLICE_PAGES))
+		return 0;
+
+	if (BPF_CORE_READ(sock, type) != SOCK_DGRAM)
+		return 0;
+
+	struct sock *sk = BPF_CORE_READ(sock, sk);
+	if (!sk)
+		return 0;
+
+	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	if (family != AF_INET && family != AF_INET6)
+		return 0;
+
+	emit_event(BLOCK_REASON_UDP_SPLICE);
+	return -EPERM;
 }
 
 char LICENSE[] SEC("license") = "GPL";

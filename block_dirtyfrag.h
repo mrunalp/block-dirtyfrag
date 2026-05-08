@@ -7,8 +7,9 @@
 
 #define AF_RXRPC 33
 
-#define BLOCK_REASON_RXRPC 1
-#define BLOCK_REASON_XFRM  2
+#define BLOCK_REASON_RXRPC      1
+#define BLOCK_REASON_XFRM       2
+#define BLOCK_REASON_UDP_SPLICE 3
 
 struct block_event {
 	__u32 pid;

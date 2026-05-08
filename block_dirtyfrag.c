@@ -25,9 +25,10 @@ static int handle_event(void *ctx, void *data, size_t len)
 
 	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
 	switch (evt->reason) {
-	case BLOCK_REASON_RXRPC: what = "AF_RXRPC socket";       break;
-	case BLOCK_REASON_XFRM:  what = "XFRM from userns";      break;
-	default:                 what = "unknown";                break;
+	case BLOCK_REASON_RXRPC:      what = "AF_RXRPC socket";       break;
+	case BLOCK_REASON_XFRM:       what = "XFRM from container";   break;
+	case BLOCK_REASON_UDP_SPLICE: what = "UDP MSG_SPLICE_PAGES";  break;
+	default:                      what = "unknown";               break;
 	}
 	fprintf(stderr, "block-dirtyfrag: BLOCKED %s pid=%-8u comm=%.*s time=%s\n",
 		what, evt->pid, 16, evt->comm, ts);
@@ -51,7 +52,7 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	fprintf(stderr, "block-dirtyfrag: blocker active — AF_RXRPC + XFRM-from-userns blocked\n");
+	fprintf(stderr, "block-dirtyfrag: blocker active — AF_RXRPC + XFRM-from-container + UDP-splice blocked\n");
 
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
 			      handle_event, NULL, NULL);
