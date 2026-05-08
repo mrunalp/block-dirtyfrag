@@ -1,18 +1,17 @@
 /* BPF LSM program to block DirtyFrag.
  *
- * Two hooks block both exploit paths:
+ * A single socket_create hook blocks both exploit paths:
  *
- * 1. socket_create — blocks AF_RXRPC socket creation, preventing the
- *    rxrpc/rxkad page-cache write path entirely.
+ * 1. Blocks AF_RXRPC socket creation — prevents the rxrpc/rxkad
+ *    page-cache write path entirely.
  *
- * 2. socket_create — blocks NETLINK_XFRM socket creation from non-init
- *    user namespaces (level > 0).  The ESP exploit must unshare into a
- *    new user namespace to gain CAP_NET_ADMIN, then create XFRM SAs
- *    via netlink.  Blocking NETLINK_XFRM at level > 0 prevents the
- *    exploit while allowing host-level IPsec/VPN (level 0) to work.
+ * 2. Blocks NETLINK_XFRM socket creation from containers — prevents
+ *    the xfrm-ESP page-cache write path.  The check covers both:
+ *    - Non-privileged containers: userns level > 0 (after unshare)
+ *    - Privileged containers: pidns level > 0 (container PID namespace)
+ *    Host-level IPsec/VPN (init userns + init pidns) is unaffected.
  *
- * Other networking (UDP, TCP, AF_ALG, AF_NETLINK for non-XFRM, etc.)
- * is completely unaffected.
+ * Other networking is completely unaffected.
  */
 
 #include <linux/types.h>
@@ -28,12 +27,21 @@ struct user_namespace {
 	int level;
 } __attribute__((preserve_access_index));
 
+struct pid_namespace {
+	unsigned int level;
+} __attribute__((preserve_access_index));
+
 struct cred___local {
 	struct user_namespace *user_ns;
 } __attribute__((preserve_access_index));
 
+struct nsproxy___local {
+	struct pid_namespace *pid_ns_for_children;
+} __attribute__((preserve_access_index));
+
 struct task_struct___local {
 	const struct cred___local *cred;
+	struct nsproxy___local *nsproxy;
 } __attribute__((preserve_access_index));
 
 #define AF_NETLINK   16
@@ -70,21 +78,28 @@ int BPF_PROG(block_dirtyfrag, int family, int type, int protocol,
 		return -EPERM;
 	}
 
-	/* Block NETLINK_XFRM from non-init user namespaces (ESP path) */
-	if (family == AF_NETLINK && protocol == NETLINK_XFRM) {
-		struct task_struct___local *task;
-		int level;
+	/* Block NETLINK_XFRM from containers (ESP path) */
+	if (family != AF_NETLINK || protocol != NETLINK_XFRM)
+		return 0;
 
-		task = (void *)bpf_get_current_task();
-		level = BPF_CORE_READ(task, cred, user_ns, level);
+	struct task_struct___local *task;
+	int level;
 
-		if (level > 0) {
-			emit_event(BLOCK_REASON_XFRM);
-			return -EPERM;
-		}
-	}
+	task = (void *)bpf_get_current_task();
+
+	level = BPF_CORE_READ(task, cred, user_ns, level);
+	if (level > 0)
+		goto block_xfrm;
+
+	level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+	if (level > 0)
+		goto block_xfrm;
 
 	return 0;
+
+block_xfrm:
+	emit_event(BLOCK_REASON_XFRM);
+	return -1;
 }
 
 char LICENSE[] SEC("license") = "GPL";
