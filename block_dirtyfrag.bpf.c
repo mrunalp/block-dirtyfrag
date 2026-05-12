@@ -38,17 +38,17 @@ struct pid_namespace {
 	unsigned int level;
 } __attribute__((preserve_access_index));
 
-struct cred___local {
+struct cred {
 	struct user_namespace *user_ns;
 } __attribute__((preserve_access_index));
 
-struct nsproxy___local {
+struct nsproxy {
 	struct pid_namespace *pid_ns_for_children;
 } __attribute__((preserve_access_index));
 
-struct task_struct___local {
-	const struct cred___local *cred;
-	struct nsproxy___local *nsproxy;
+struct task_struct {
+	const struct cred *cred;
+	struct nsproxy *nsproxy;
 } __attribute__((preserve_access_index));
 
 struct sock_common {
@@ -114,16 +114,14 @@ int BPF_PROG(block_dirtyfrag, int family, int type, int protocol,
 	if (family != AF_NETLINK || protocol != NETLINK_XFRM)
 		return 0;
 
-	struct task_struct___local *task;
+	struct task_struct *task = bpf_get_current_task_btf();
 	int level;
 
-	task = (void *)bpf_get_current_task();
-
-	level = BPF_CORE_READ(task, cred, user_ns, level);
+	level = task->cred->user_ns->level;
 	if (level > 0)
 		goto block_xfrm;
 
-	level = BPF_CORE_READ(task, nsproxy, pid_ns_for_children, level);
+	level = task->nsproxy->pid_ns_for_children->level;
 	if (level > 0)
 		goto block_xfrm;
 
@@ -144,17 +142,17 @@ int BPF_PROG(block_udp_splice, struct socket *sock,
 	if (ret)
 		return ret;
 
-	if (!(BPF_CORE_READ(msg, msg_flags) & MSG_SPLICE_PAGES))
+	if (!(msg->msg_flags & MSG_SPLICE_PAGES))
 		return 0;
 
-	if (BPF_CORE_READ(sock, type) != SOCK_DGRAM)
+	if (sock->type != SOCK_DGRAM)
 		return 0;
 
-	struct sock *sk = BPF_CORE_READ(sock, sk);
+	struct sock *sk = sock->sk;
 	if (!sk)
 		return 0;
 
-	__u16 family = BPF_CORE_READ(sk, __sk_common.skc_family);
+	__u16 family = sk->__sk_common.skc_family;
 	if (family != AF_INET && family != AF_INET6)
 		return 0;
 

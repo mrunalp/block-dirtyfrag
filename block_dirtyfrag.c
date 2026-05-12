@@ -15,11 +15,16 @@ static void sig_handler(int sig)
 	running = 0;
 }
 
+static __u64 boot_time_ns;
+
 static int handle_event(void *ctx, void *data, size_t len)
 {
+	if (len < sizeof(struct block_event))
+		return 0;
+
 	struct block_event *evt = data;
-	time_t now = time(NULL);
-	struct tm *tm = localtime(&now);
+	time_t event_sec = (evt->ts + boot_time_ns) / 1000000000ULL;
+	struct tm *tm = localtime(&event_sec);
 	char ts[32];
 	const char *what;
 
@@ -61,6 +66,12 @@ int main(int argc, char **argv)
 		block_dirtyfrag_bpf__destroy(skel);
 		return 1;
 	}
+
+	struct timespec rt, bt;
+	clock_gettime(CLOCK_REALTIME, &rt);
+	clock_gettime(CLOCK_BOOTTIME, &bt);
+	boot_time_ns = (__u64)rt.tv_sec * 1000000000ULL + rt.tv_nsec
+		     - (__u64)bt.tv_sec * 1000000000ULL - bt.tv_nsec;
 
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
