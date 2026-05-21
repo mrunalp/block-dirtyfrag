@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <bpf/libbpf.h>
+#include <bpf/bpf.h>
 #include "block_dirtyfrag.h"
 #include "block_dirtyfrag.skel.h"
 
@@ -30,13 +31,41 @@ static int handle_event(void *ctx, void *data, size_t len)
 
 	strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
 	switch (evt->reason) {
-	case BLOCK_REASON_RXRPC:      what = "AF_RXRPC socket";       break;
-	case BLOCK_REASON_XFRM:       what = "XFRM from container";   break;
-	case BLOCK_REASON_UDP_SPLICE: what = "UDP MSG_SPLICE_PAGES";  break;
-	default:                      what = "unknown";               break;
+	case BLOCK_REASON_RXRPC:      what = "AF_RXRPC socket";          break;
+	case BLOCK_REASON_UDP_SPLICE: what = "UDP MSG_SPLICE_PAGES";     break;
+	case BLOCK_REASON_ESPINTCP:   what = "TCP_ULP espintcp";         break;
+	case BLOCK_REASON_UDP_ENCAP:  what = "UDP_ENCAP from container"; break;
+	default:                      what = "unknown";                  break;
 	}
 	fprintf(stderr, "block-dirtyfrag: BLOCKED %s pid=%-8u comm=%.*s time=%s\n",
 		what, evt->pid, 16, evt->comm, ts);
+	return 0;
+}
+
+static int populate_init_net_ns(struct block_dirtyfrag_bpf *skel)
+{
+	char link[64];
+	ssize_t len = readlink("/proc/1/ns/net", link, sizeof(link) - 1);
+	if (len < 0) {
+		fprintf(stderr, "block-dirtyfrag: failed to read /proc/1/ns/net\n");
+		return -1;
+	}
+	link[len] = '\0';
+
+	__u32 inum = 0;
+	if (sscanf(link, "net:[%u]", &inum) != 1) {
+		fprintf(stderr, "block-dirtyfrag: failed to parse net ns inum from '%s'\n", link);
+		return -1;
+	}
+
+	__u32 key = 0;
+	int fd = bpf_map__fd(skel->maps.init_net_ns);
+	if (bpf_map_update_elem(fd, &key, &inum, BPF_ANY)) {
+		fprintf(stderr, "block-dirtyfrag: failed to populate init_net_ns map\n");
+		return -1;
+	}
+
+	fprintf(stderr, "block-dirtyfrag: init net namespace inum=%u\n", inum);
 	return 0;
 }
 
@@ -51,13 +80,18 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	if (populate_init_net_ns(skel)) {
+		block_dirtyfrag_bpf__destroy(skel);
+		return 1;
+	}
+
 	if (block_dirtyfrag_bpf__attach(skel)) {
 		fprintf(stderr, "block-dirtyfrag: failed to attach BPF program\n");
 		block_dirtyfrag_bpf__destroy(skel);
 		return 1;
 	}
 
-	fprintf(stderr, "block-dirtyfrag: blocker active — AF_RXRPC + XFRM-from-container + UDP-splice blocked\n");
+	fprintf(stderr, "block-dirtyfrag: blocker active — AF_RXRPC + UDP-splice + espintcp + UDP-encap blocked\n");
 
 	rb = ring_buffer__new(bpf_map__fd(skel->maps.events),
 			      handle_event, NULL, NULL);
